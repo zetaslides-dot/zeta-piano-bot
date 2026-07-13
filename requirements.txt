@@ -4,4 +4,5 @@ pretty-midi==0.2.10
 requests==2.31.0
 beautifulsoup4==4.12.2
 socksio
-httpx
+httpx>=0.27.0
+httpcore>=1.0.0
