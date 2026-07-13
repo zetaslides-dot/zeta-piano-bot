@@ -1,9 +1,17 @@
+import typing
+import sys
 import os
 import logging
 import re
 import sqlite3
 import threading
 from io import BytesIO
+
+# --- ПАТЧ ДЛЯ PYTHON 3.14 ---
+if sys.version_info >= (3, 14):
+    if not hasattr(typing.Union, '__module__'):
+        setattr(typing.Union, '__module__', 'typing')
+
 from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
