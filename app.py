@@ -1,21 +1,13 @@
-import typing
-import sys
 import os
 import logging
 import re
 import sqlite3
 import threading
 from io import BytesIO
-
-# --- ПАТЧ ДЛЯ PYTHON 3.14 ---
-if sys.version_info >= (3, 14):
-    if not hasattr(typing.Union, '__module__'):
-        setattr(typing.Union, '__module__', 'typing')
-
 from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import pretty_midi
+from midiutil import MIDIFile
 import requests
 from bs4 import BeautifulSoup
 
@@ -23,7 +15,6 @@ from bs4 import BeautifulSoup
 TOKEN = "8690077939:AAHQ22wV8zPQRdzXikhxUVNhtnzzBFRYwms"
 logging.basicConfig(level=logging.INFO)
 
-# --- FLASK СЕРВЕР (чтобы Render не убивал бота) ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -75,10 +66,18 @@ def search_midi(song_name):
         logging.error(f"Ошибка поиска: {e}")
         return None
 
-# --- КОНВЕРТЕР ---
+# --- НОВЫЙ КОНВЕРТЕР (без pretty-midi) ---
 def midi_to_virtual_piano(midi_data):
+    """
+    Конвертирует MIDI-файл в текст для Virtual Piano.
+    Использует упрощённый парсинг без внешних библиотек.
+    """
     try:
-        midi = pretty_midi.PrettyMIDI(BytesIO(midi_data))
+        # Читаем MIDI как бинарные данные
+        import struct
+        
+        # Простейший парсинг: ищем ноты в MIDI-потоке
+        notes = []
         key_map = {
             60: 'q', 61: '2', 62: 'w', 63: '3', 64: 'e',
             65: 'r', 66: '5', 67: 't', 68: '6', 69: 'y',
@@ -88,11 +87,14 @@ def midi_to_virtual_piano(midi_data):
             85: 'l', 86: 'z', 87: 'x', 88: 'c', 89: 'v',
             90: 'b', 91: 'n', 92: 'm'
         }
-        notes = []
-        for instrument in midi.instruments:
-            for note in instrument.notes:
-                if note.pitch in key_map:
-                    notes.append(key_map[note.pitch])
+        
+        # Простой парсинг: ищем байты 0x90 (note on) и 0x80 (note off)
+        for i in range(len(midi_data) - 2):
+            if midi_data[i] in [0x90, 0x80]:  # Note on/off
+                note = midi_data[i+1]
+                if note in key_map:
+                    notes.append(key_map[note])
+        
         return ' '.join(notes) if notes else None
     except Exception as e:
         logging.error(f"Ошибка конвертации: {e}")
@@ -150,7 +152,7 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     notes_text = midi_to_virtual_piano(midi_data)
     if not notes_text:
-        await update.message.reply_text("❌ Ошибка конвертации.")
+        await update.message.reply_text("❌ Ошибка конвертации. Попробуй другую песню.")
         return
     
     bpm = 120
@@ -172,7 +174,7 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         os.remove(f"{song_name}.txt")
 
-# --- ЗАПУСК ТЕЛЕГРАМ-БОТА В ОТДЕЛЬНОМ ПОТОКЕ ---
+# --- ЗАПУСК ---
 def run_bot():
     init_db()
     bot_app = Application.builder().token(TOKEN).build()
@@ -181,12 +183,8 @@ def run_bot():
     print("🔥 Telegram-бот запущен!")
     bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-# --- ЗАПУСК ВСЕГО ---
 if __name__ == "__main__":
-    # Запускаем бота в фоновом потоке
     bot_thread = threading.Thread(target=run_bot)
     bot_thread.start()
-    
-    # Запускаем Flask-сервер (для Render)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
