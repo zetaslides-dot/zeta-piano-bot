@@ -14,7 +14,6 @@ import struct
 # --- НАСТРОЙКА ---
 TOKEN = "8690077939:AAHQ22wV8zPQRdzXikhxUVNhtnzzBFRYwms"
 
-# Настройка логирования (чтобы видеть всё в логах Render)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -95,9 +94,8 @@ def midi_to_virtual_piano(midi_data):
         }
         
         notes = []
-        # Ищем ноты в MIDI-данных
         for i in range(len(midi_data) - 2):
-            if midi_data[i] in [0x90, 0x80]:  # Note on/off
+            if midi_data[i] in [0x90, 0x80]:
                 note = midi_data[i+1]
                 if note in key_map:
                     notes.append(key_map[note])
@@ -112,7 +110,6 @@ def midi_to_virtual_piano(midi_data):
         logger.error(f"Ошибка конвертации: {e}")
         return None
 
-# --- СКАЧИВАНИЕ MIDI ---
 def download_midi(url):
     logger.info(f"Скачивание MIDI: {url}")
     try:
@@ -145,10 +142,8 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info(f"Запрос песни от {user.username or user.first_name}: {song_name}")
     
-    # Отправляем статус "печатает..."
     await update.message.chat.send_action(action='typing')
     
-    # Проверка кэша
     cached = get_from_cache(song_name)
     if cached:
         notes, bpm = cached
@@ -162,7 +157,6 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Поиск MIDI
     status_msg = await update.message.reply_text(f"🔍 Ищу MIDI для '{song_name}'...")
     
     midi_url = search_midi(song_name)
@@ -175,7 +169,6 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    f"• Попробовать другую песню")
         return
     
-    # Скачивание MIDI
     await status_msg.edit_text(f"📥 Скачиваю MIDI...")
     
     midi_data = download_midi(midi_url)
@@ -183,7 +176,6 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Ошибка скачивания MIDI для '{song_name}'.")
         return
     
-    # Конвертация
     await status_msg.edit_text(f"🔄 Конвертирую MIDI в ноты...")
     
     notes_text = midi_to_virtual_piano(midi_data)
@@ -192,11 +184,9 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    f"MIDI-файл не содержит распознаваемых нот.")
         return
     
-    # Сохраняем в кэш
     bpm = 120
     save_to_cache(song_name, notes_text, bpm)
     
-    # Отправляем результат
     note_count = len(notes_text.split())
     if len(notes_text) <= 4000:
         await status_msg.edit_text(
@@ -209,7 +199,6 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         logger.info(f"Отправлены ноты для: {song_name} ({note_count} нот)")
     else:
-        # Если нот слишком много — отправляем файлом
         filename = f"{song_name}_notes.txt"
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(notes_text)
@@ -228,7 +217,7 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(filename)
         logger.info(f"Отправлен файл с нотами для: {song_name}")
 
-# --- ЗАПУСК ---
+# --- ЗАПУСК БОТА ---
 def run_bot():
     try:
         logger.info("Инициализация базы данных...")
@@ -244,14 +233,17 @@ def run_bot():
     except Exception as e:
         logger.error(f"Критическая ошибка при запуске бота: {e}")
 
-if __name__ == "__main__":
-    # Запускаем бота в фоновом потоке
-    logger.info("Запуск бота в фоновом потоке...")
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
-    
-    # Запускаем Flask-сервер (для Render)
+# --- ЗАПУСК FLASK В ФОНОВОМ ПОТОКЕ ---
+def run_flask():
     port = int(os.environ.get("PORT", 5000))
     logger.info(f"Запуск Flask-сервера на порту {port}...")
     app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    # Запускаем Flask в фоновом потоке
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # Запускаем бота в основном потоке (теперь он главный)
+    run_bot()
