@@ -1,8 +1,12 @@
 flask
 python-telegram-bot>=20.7
-midiutil
 requests==2.31.0
 beautifulsoup4==4.12.2
 socksio
 httpx>=0.27.0
 httpcore>=1.0.0
+yt-dlp
+basic-pitch
+librosa
+numpy
+scipy
