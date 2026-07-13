@@ -3,13 +3,12 @@ import logging
 import re
 import sqlite3
 import threading
-from io import BytesIO
+import time
 from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import requests
 from bs4 import BeautifulSoup
-import struct
 
 # --- НАСТРОЙКА ---
 TOKEN = "8690077939:AAHQ22wV8zPQRdzXikhxUVNhtnzzBFRYwms"
@@ -59,25 +58,134 @@ def save_to_cache(song_name, notes, bpm):
     conn.close()
     logger.info(f"Сохранено в кэш: {song_name}")
 
-# --- ПОИСК MIDI ---
+# --- ПОИСК MIDI (НОВАЯ ВЕРСИЯ) ---
 def search_midi(song_name):
+    """Ищет MIDI на нескольких сайтах"""
     logger.info(f"Поиск MIDI для: {song_name}")
-    search_url = f"https://midishow.com/search/result?search={song_name.replace(' ', '+')}"
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    # Очищаем название для поиска
+    search_query = song_name.replace(' ', '+')
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
+    # --- 1. ПРЯМОЙ ПОИСК НА MIDISHOW ---
     try:
-        response = requests.get(search_url, headers=headers, timeout=30)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        link = soup.find('a', href=re.compile(r'/midi/\d+'))
-        if link:
-            midi_id = re.search(r'/midi/(\d+)', link['href']).group(1)
-            url = f"https://midishow.com/midi/download/{midi_id}"
-            logger.info(f"Найден MIDI: {url}")
-            return url
-        logger.warning(f"MIDI не найден: {song_name}")
-        return None
+        url = f"https://midishow.com/search/result?search={search_query}"
+        logger.info(f"Пробую MidiShow: {url}")
+        response = requests.get(url, headers=headers, timeout=15)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Ищем ссылки на скачивание
+            download_links = soup.find_all('a', href=re.compile(r'/midi/download/\d+'))
+            for link in download_links:
+                href = link.get('href')
+                if href:
+                    if href.startswith('/'):
+                        href = f"https://midishow.com{href}"
+                    logger.info(f"Найден MIDI (MidiShow): {href}")
+                    return href
+            
+            # Ищем ссылки на страницы с MIDI
+            midi_links = soup.find_all('a', href=re.compile(r'/midi/\d+'))
+            for link in midi_links[:5]:  # Проверяем первые 5
+                href = link.get('href')
+                if href and 'download' not in href:
+                    page_url = f"https://midishow.com{href}"
+                    logger.info(f"Проверяем страницу: {page_url}")
+                    try:
+                        time.sleep(0.5)  # Небольшая задержка, чтобы не банили
+                        page_response = requests.get(page_url, headers=headers, timeout=10)
+                        if page_response.status_code == 200:
+                            page_soup = BeautifulSoup(page_response.text, 'html.parser')
+                            # Ищем кнопку скачивания
+                            download_link = page_soup.find('a', href=re.compile(r'/midi/download/\d+'))
+                            if download_link:
+                                dl_href = download_link.get('href')
+                                if dl_href:
+                                    if dl_href.startswith('/'):
+                                        dl_href = f"https://midishow.com{dl_href}"
+                                    logger.info(f"Найден MIDI на странице: {dl_href}")
+                                    return dl_href
+                    except Exception as e:
+                        logger.error(f"Ошибка при переходе на страницу: {e}")
+                        continue
     except Exception as e:
-        logger.error(f"Ошибка поиска: {e}")
-        return None
+        logger.error(f"Ошибка MidiShow: {e}")
+    
+    # --- 2. ПОИСК НА BITMIDI ---
+    try:
+        url = f"https://bitmidi.com/search/{song_name.replace(' ', '%20')}"
+        logger.info(f"Пробую BitMidi: {url}")
+        response = requests.get(url, headers=headers, timeout=15)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Ищем ссылки на .mid файлы
+            for link in soup.find_all('a', href=True):
+                href = link.get('href')
+                if href and href.endswith('.mid'):
+                    if href.startswith('/'):
+                        href = f"https://bitmidi.com{href}"
+                    logger.info(f"Найден MIDI (BitMidi): {href}")
+                    return href
+                
+                # Ищем ссылки на страницы с MIDI
+                if href and '/midi/' in href and 'search' not in href:
+                    page_url = href if href.startswith('http') else f"https://bitmidi.com{href}"
+                    logger.info(f"Проверяем страницу BitMidi: {page_url}")
+                    try:
+                        time.sleep(0.5)
+                        page_response = requests.get(page_url, headers=headers, timeout=10)
+                        if page_response.status_code == 200:
+                            page_soup = BeautifulSoup(page_response.text, 'html.parser')
+                            # Ищем прямую ссылку на .mid
+                            for file_link in page_soup.find_all('a', href=True):
+                                file_href = file_link.get('href')
+                                if file_href and (file_href.endswith('.mid') or '/download/' in file_href):
+                                    if file_href.startswith('/'):
+                                        file_href = f"https://bitmidi.com{file_href}"
+                                    logger.info(f"Найден MIDI на странице BitMidi: {file_href}")
+                                    return file_href
+                    except Exception as e:
+                        logger.error(f"Ошибка при переходе на страницу BitMidi: {e}")
+                        continue
+    except Exception as e:
+        logger.error(f"Ошибка BitMidi: {e}")
+    
+    # --- 3. ПОИСК НА FREEMIDI ---
+    try:
+        url = f"https://freemidi.org/search?q={search_query}"
+        logger.info(f"Пробую FreeMidi: {url}")
+        response = requests.get(url, headers=headers, timeout=15)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Ищем ссылки на скачивание
+            for link in soup.find_all('a', href=True):
+                href = link.get('href')
+                if href and '/download/' in href:
+                    if href.startswith('/'):
+                        href = f"https://freemidi.org{href}"
+                    logger.info(f"Найден MIDI (FreeMidi): {href}")
+                    return href
+                
+                # Ищем ссылки на .mid файлы
+                if href and href.endswith('.mid'):
+                    if href.startswith('/'):
+                        href = f"https://freemidi.org{href}"
+                    logger.info(f"Найден MIDI (FreeMidi): {href}")
+                    return href
+    except Exception as e:
+        logger.error(f"Ошибка FreeMidi: {e}")
+    
+    logger.warning(f"MIDI не найден: {song_name}")
+    return None
 
 # --- КОНВЕРТЕР ---
 def midi_to_virtual_piano(midi_data):
@@ -113,7 +221,8 @@ def midi_to_virtual_piano(midi_data):
 def download_midi(url):
     logger.info(f"Скачивание MIDI: {url}")
     try:
-        response = requests.get(url, timeout=30)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        response = requests.get(url, headers=headers, timeout=30)
         if response.status_code == 200:
             logger.info(f"MIDI скачан. Размер: {len(response.content)} байт")
             return response.content
@@ -144,6 +253,7 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.chat.send_action(action='typing')
     
+    # Проверка кэша
     cached = get_from_cache(song_name)
     if cached:
         notes, bpm = cached
@@ -245,5 +355,5 @@ if __name__ == "__main__":
     flask_thread.daemon = True
     flask_thread.start()
     
-    # Запускаем бота в основном потоке (теперь он главный)
+    # Запускаем бота в основном потоке
     run_bot()
