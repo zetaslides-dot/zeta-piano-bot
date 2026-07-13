@@ -4,12 +4,18 @@ import re
 import sqlite3
 import threading
 import time
+import subprocess
+import tempfile
 from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus
+import yt_dlp
+from basic_pitch.inference import predict_and_save
+import librosa
+import numpy as np
 
 # --- НАСТРОЙКА ---
 TOKEN = "8690077939:AAHQ22wV8zPQRdzXikhxUVNhtnzzBFRYwms"
@@ -59,12 +65,11 @@ def save_to_cache(song_name, notes, bpm):
     conn.close()
     logger.info(f"Сохранено в кэш: {song_name}")
 
-# --- УЛУЧШЕННЫЙ ПОИСК MIDI ---
+# --- ПОИСК MIDI (СТАРАЯ ВЕРСИЯ ДЛЯ НАЗВАНИЙ) ---
 def search_midi(song_name):
     """Ищет MIDI на нескольких сайтах, пробуя разные вариации названия"""
     logger.info(f"Поиск MIDI для: {song_name}")
     
-    # Генерируем варианты названий для поиска
     search_terms = [
         song_name,
         f"{song_name} midi",
@@ -72,38 +77,26 @@ def search_midi(song_name):
         f"{song_name} filetype:mid",
     ]
     
-    # Если название состоит из нескольких слов, пробуем убрать лишнее
     parts = song_name.split()
     if len(parts) > 2:
-        search_terms.append(' '.join(parts[:2]))  # Первые два слова
-        search_terms.append(' '.join(parts[1:]))  # Последние слова
+        search_terms.append(' '.join(parts[:2]))
+        search_terms.append(' '.join(parts[1:]))
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
     }
     
     session = requests.Session()
     
-    # --- 1. MidiShow ---
-    for term in search_terms[:3]:  # Пробуем первые 3 варианта
+    # --- MidiShow ---
+    for term in search_terms[:3]:
         try:
-            encoded_term = quote_plus(term)
-            url = f"https://midishow.com/search/result?search={encoded_term}"
+            url = f"https://midishow.com/search/result?search={quote_plus(term)}"
             logger.info(f"Пробую MidiShow: {url}")
-            
             response = session.get(url, headers=headers, timeout=15)
             if response.status_code != 200:
                 continue
-                
             soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Ищем ссылки на скачивание
             download_links = soup.find_all('a', href=re.compile(r'/midi/download/\d+'))
             for link in download_links:
                 href = link.get('href')
@@ -112,8 +105,6 @@ def search_midi(song_name):
                         href = f"https://midishow.com{href}"
                     logger.info(f"Найден MIDI (MidiShow): {href}")
                     return href
-            
-            # Ищем ссылки на страницы с MIDI
             midi_links = soup.find_all('a', href=re.compile(r'/midi/\d+'))
             for link in midi_links[:5]:
                 href = link.get('href')
@@ -137,20 +128,15 @@ def search_midi(song_name):
         except Exception as e:
             logger.error(f"Ошибка MidiShow: {e}")
     
-    # --- 2. BitMidi ---
+    # --- BitMidi ---
     for term in search_terms[:3]:
         try:
-            encoded_term = quote_plus(term)
-            url = f"https://bitmidi.com/search/{encoded_term}"
+            url = f"https://bitmidi.com/search/{quote_plus(term)}"
             logger.info(f"Пробую BitMidi: {url}")
-            
             response = session.get(url, headers=headers, timeout=15)
             if response.status_code != 200:
                 continue
-                
             soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Ищем ссылки на .mid файлы
             for link in soup.find_all('a', href=True):
                 href = link.get('href')
                 if href and href.endswith('.mid'):
@@ -158,7 +144,6 @@ def search_midi(song_name):
                         href = f"https://bitmidi.com{href}"
                     logger.info(f"Найден MIDI (BitMidi): {href}")
                     return href
-                
                 if href and '/midi/' in href and 'search' not in href:
                     page_url = href if href.startswith('http') else f"https://bitmidi.com{href}"
                     try:
@@ -178,19 +163,15 @@ def search_midi(song_name):
         except Exception as e:
             logger.error(f"Ошибка BitMidi: {e}")
     
-    # --- 3. FreeMidi ---
+    # --- FreeMidi ---
     for term in search_terms[:3]:
         try:
-            encoded_term = quote_plus(term)
-            url = f"https://freemidi.org/search?q={encoded_term}"
+            url = f"https://freemidi.org/search?q={quote_plus(term)}"
             logger.info(f"Пробую FreeMidi: {url}")
-            
             response = session.get(url, headers=headers, timeout=15)
             if response.status_code != 200:
                 continue
-                
             soup = BeautifulSoup(response.text, 'html.parser')
-            
             for link in soup.find_all('a', href=True):
                 href = link.get('href')
                 if href and ('/download/' in href or href.endswith('.mid')):
@@ -201,35 +182,101 @@ def search_midi(song_name):
         except Exception as e:
             logger.error(f"Ошибка FreeMidi: {e}")
     
-    # --- 4. MidiFiles ---
-    for term in search_terms[:2]:
-        try:
-            encoded_term = quote_plus(term)
-            url = f"https://midifiles.com/search?q={encoded_term}"
-            logger.info(f"Пробую MidiFiles: {url}")
-            
-            response = session.get(url, headers=headers, timeout=15)
-            if response.status_code != 200:
-                continue
-                
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            for link in soup.find_all('a', href=True):
-                href = link.get('href')
-                if href and '/download/' in href:
-                    if href.startswith('/'):
-                        href = f"https://midifiles.com{href}"
-                    logger.info(f"Найден MIDI (MidiFiles): {href}")
-                    return href
-        except Exception as e:
-            logger.error(f"Ошибка MidiFiles: {e}")
-    
     logger.warning(f"MIDI не найден: {song_name}")
     return None
 
-# --- КОНВЕРТЕР ---
-def midi_to_virtual_piano(midi_data):
-    logger.info("Начало конвертации MIDI...")
+# --- НОВЫЙ КОНВЕЙЕР: YOUTUBE → AUDIO → MIDI ---
+def download_audio_from_youtube(youtube_url):
+    """Скачивает аудио с YouTube и возвращает путь к файлу"""
+    logger.info(f"Скачивание аудио с YouTube: {youtube_url}")
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'wav',
+                'preferredquality': '192',
+            }],
+            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=True)
+                filename = ydl.prepare_filename(info)
+                # Меняем расширение на .wav
+                wav_filename = filename.rsplit('.', 1)[0] + '.wav'
+                logger.info(f"Аудио скачано: {wav_filename}")
+                return wav_filename
+        except Exception as e:
+            logger.error(f"Ошибка скачивания YouTube: {e}")
+            return None
+
+def audio_to_midi(audio_path):
+    """Конвертирует аудио в MIDI с помощью basic-pitch"""
+    logger.info(f"Конвертация аудио в MIDI: {audio_path}")
+    
+    try:
+        # Создаём временную папку для MIDI
+        with tempfile.TemporaryDirectory() as output_dir:
+            # Запускаем basic-pitch
+            predict_and_save(
+                [audio_path],
+                output_dir,
+                save_midi=True,
+                sonify_midi=False,
+                save_model_outputs=False
+            )
+            
+            # Ищем созданный MIDI-файл
+            midi_files = [f for f in os.listdir(output_dir) if f.endswith('.mid')]
+            if midi_files:
+                midi_path = os.path.join(output_dir, midi_files[0])
+                logger.info(f"MIDI создан: {midi_path}")
+                
+                # Читаем MIDI-файл и возвращаем его содержимое
+                with open(midi_path, 'rb') as f:
+                    midi_data = f.read()
+                return midi_data
+            else:
+                logger.error("MIDI-файл не найден")
+                return None
+    except Exception as e:
+        logger.error(f"Ошибка конвертации аудио в MIDI: {e}")
+        return None
+
+def youtube_to_roblox_notes(youtube_url):
+    """Полный конвейер: YouTube → ноты для Roblox"""
+    logger.info(f"Запуск конвейера YouTube → Roblox: {youtube_url}")
+    
+    # Шаг 1: Скачиваем аудио
+    audio_path = download_audio_from_youtube(youtube_url)
+    if not audio_path:
+        return None
+    
+    # Шаг 2: Конвертируем аудио в MIDI
+    midi_data = audio_to_midi(audio_path)
+    if not midi_data:
+        return None
+    
+    # Шаг 3: Конвертируем MIDI в ноты Roblox
+    notes_text = midi_to_roblox_notes(midi_data)
+    
+    # Шаг 4: Очищаем временные файлы
+    try:
+        os.remove(audio_path)
+    except:
+        pass
+    
+    return notes_text
+
+# --- КОНВЕРТЕР MIDI → ROBLOX ---
+def midi_to_roblox_notes(midi_data):
+    """Конвертирует MIDI-данные в текст для Virtual Piano"""
+    logger.info("Начало конвертации MIDI в ноты Roblox...")
     try:
         key_map = {
             60: 'q', 61: '2', 62: 'w', 63: '3', 64: 'e',
@@ -275,31 +322,41 @@ def download_midi(url):
         logger.error(f"Ошибка скачивания: {e}")
         return None
 
-# --- ОБРАБОТЧИКИ (без изменений) ---
+# --- ОБРАБОТЧИКИ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info(f"Команда /start от пользователя: {user.username or user.first_name} (ID: {user.id})")
     await update.message.reply_text(
         "🎹 **Zeta Piano Converter**\n\n"
-        "✅ Бот работает!\n"
-        "📝 Напиши название песни, и я найду ноты для Virtual Piano.\n"
-        "Пример: `Shape of You`\n\n"
+        "✅ Бот работает!\n\n"
+        "📝 **Как использовать:**\n"
+        "1. Напиши название песни (например, `Shape of You`)\n"
+        "2. Или отправь ссылку на YouTube (например, `https://youtu.be/...`)\n\n"
         "⚡ Статус: Онлайн",
         parse_mode='Markdown'
     )
 
 async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    song_name = update.message.text.strip()
+    user_input = update.message.text.strip()
     user = update.effective_user
-    logger.info(f"Запрос песни от {user.username or user.first_name}: {song_name}")
+    logger.info(f"Запрос от {user.username or user.first_name}: {user_input}")
     
     await update.message.chat.send_action(action='typing')
+    
+    # Проверяем, является ли запрос ссылкой на YouTube
+    if re.search(r'(youtube\.com|youtu\.be)', user_input):
+        await handle_youtube(update, user_input)
+    else:
+        await handle_search(update, user_input)
+
+async def handle_search(update: Update, song_name: str):
+    """Обработка поиска по названию"""
+    status_msg = await update.message.reply_text(f"🔍 Ищу MIDI для '{song_name}'...")
     
     cached = get_from_cache(song_name)
     if cached:
         notes, bpm = cached
-        logger.info(f"Отправка из кэша для: {song_name}")
-        await update.message.reply_text(
+        await status_msg.edit_text(
             f"🎵 **{song_name.title()}** (из кэша ⚡)\n"
             f"📊 BPM: {bpm}\n\n"
             f"```\n{notes[:500]}{'...' if len(notes) > 500 else ''}\n```\n"
@@ -308,37 +365,92 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    status_msg = await update.message.reply_text(f"🔍 Ищу MIDI для '{song_name}'...")
-    
     midi_url = search_midi(song_name)
     if not midi_url:
-        logger.warning(f"MIDI не найден для: {song_name}")
-        await status_msg.edit_text(f"❌ Не нашёл MIDI для '{song_name}'.\n"
-                                   f"Попробуй:\n"
-                                   f"• Написать по-английски\n"
-                                   f"• Уточнить название\n"
-                                   f"• Попробовать другую песню")
+        await status_msg.edit_text(
+            f"❌ Не нашёл MIDI для '{song_name}'.\n\n"
+            f"Попробуй:\n"
+            f"• Отправить ссылку на YouTube\n"
+            f"• Уточнить название\n"
+            f"• Попробовать другую песню"
+        )
         return
     
     await status_msg.edit_text(f"📥 Скачиваю MIDI...")
-    
     midi_data = download_midi(midi_url)
     if not midi_data:
         await status_msg.edit_text(f"❌ Ошибка скачивания MIDI для '{song_name}'.")
         return
     
     await status_msg.edit_text(f"🔄 Конвертирую MIDI в ноты...")
-    
-    notes_text = midi_to_virtual_piano(midi_data)
+    notes_text = midi_to_roblox_notes(midi_data)
     if not notes_text:
-        await status_msg.edit_text(f"❌ Не удалось сконвертировать '{song_name}'.\n"
-                                   f"MIDI-файл не содержит распознаваемых нот.")
+        await status_msg.edit_text(f"❌ Не удалось сконвертировать '{song_name}'.")
         return
     
     bpm = 120
     save_to_cache(song_name, notes_text, bpm)
+    await send_notes(update, song_name, notes_text, bpm, status_msg)
+
+async def handle_youtube(update: Update, youtube_url: str):
+    """Обработка ссылки на YouTube"""
+    status_msg = await update.message.reply_text("🎵 **YouTube → Roblox**\n\n⏳ Скачиваю аудио с YouTube...")
     
+    try:
+        # Шаг 1: Скачиваем аудио
+        await status_msg.edit_text("🎵 **YouTube → Roblox**\n\n✅ Аудио скачано!\n⏳ Конвертирую в MIDI...")
+        
+        # Шаг 2: Конвертируем аудио в MIDI
+        audio_path = download_audio_from_youtube(youtube_url)
+        if not audio_path:
+            await status_msg.edit_text("❌ Не удалось скачать аудио с YouTube.\nПроверь ссылку или попробуй другую.")
+            return
+        
+        await status_msg.edit_text("🎵 **YouTube → Roblox**\n\n✅ Аудио скачано!\n✅ MIDI создан!\n⏳ Конвертирую в ноты для Roblox...")
+        
+        midi_data = audio_to_midi(audio_path)
+        if not midi_data:
+            await status_msg.edit_text("❌ Не удалось конвертировать аудио в MIDI.\nПопробуй другую песню.")
+            try:
+                os.remove(audio_path)
+            except:
+                pass
+            return
+        
+        await status_msg.edit_text("🎵 **YouTube → Roblox**\n\n✅ Аудио скачано!\n✅ MIDI создан!\n✅ Ноты готовы!\n📤 Отправляю...")
+        
+        # Шаг 3: Конвертируем MIDI в ноты Roblox
+        notes_text = midi_to_roblox_notes(midi_data)
+        if not notes_text:
+            await status_msg.edit_text("❌ Не удалось сконвертировать MIDI в ноты.\nПопробуй другую песню.")
+            try:
+                os.remove(audio_path)
+            except:
+                pass
+            return
+        
+        # Шаг 4: Сохраняем в кэш
+        song_name = f"youtube_{int(time.time())}"  # Временное имя для кэша
+        bpm = 120
+        save_to_cache(song_name, notes_text, bpm)
+        
+        # Шаг 5: Отправляем
+        await send_notes(update, "YouTube", notes_text, bpm, status_msg)
+        
+        # Шаг 6: Очищаем
+        try:
+            os.remove(audio_path)
+        except:
+            pass
+            
+    except Exception as e:
+        logger.error(f"Ошибка в YouTube конвейере: {e}")
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}\nПопробуй другую песню или ссылку.")
+
+async def send_notes(update: Update, song_name: str, notes_text: str, bpm: int, status_msg):
+    """Отправляет ноты пользователю"""
     note_count = len(notes_text.split())
+    
     if len(notes_text) <= 4000:
         await status_msg.edit_text(
             f"🎵 **{song_name.title()}**\n"
@@ -348,9 +460,8 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Скопируй текст и вставь в Virtual Piano!",
             parse_mode='Markdown'
         )
-        logger.info(f"Отправлены ноты для: {song_name} ({note_count} нот)")
     else:
-        filename = f"{song_name}_notes.txt"
+        filename = f"{song_name.replace(' ', '_')}_notes.txt"
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(notes_text)
         
@@ -366,9 +477,8 @@ async def handle_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename=filename
         )
         os.remove(filename)
-        logger.info(f"Отправлен файл с нотами для: {song_name}")
 
-# --- ЗАПУСК (без изменений) ---
+# --- ЗАПУСК БОТА ---
 def run_bot():
     try:
         logger.info("Инициализация базы данных...")
